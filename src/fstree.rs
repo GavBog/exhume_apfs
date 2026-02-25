@@ -644,6 +644,57 @@ impl FsTree {
 
 
 
+    /// Scans the entire BTree sequentially and returns all Inodes and Directory Records.
+    /// This avoids O(N log N) disk seeks during full filesystem enumeration.
+    pub fn scan_all_records<T: std::io::Read + std::io::Seek>(
+        &self,
+        apfs: &mut crate::APFS<T>,
+    ) -> Result<(std::collections::HashMap<u64, InodeVal>, std::collections::HashMap<u64, Vec<DirEntry>>), String> {
+        apfs.set_active_omap(Some(self.omap.clone()), self.xid);
+        let mut cur = self.root_tree.seek(apfs, &[], &BTreeKeyCmp::Lex)?;
+        
+        let mut inodes = std::collections::HashMap::new();
+        let mut raw_drecs = Vec::new();
+        let mut private_to_id = std::collections::HashMap::new();
+
+        while let Some((k, v)) = cur.next(apfs)? {
+            let Some(hdr) = JKey::from_bytes(&k) else { continue; };
+            if hdr.obj_type == APFS_TYPE_INODE {
+                if let Ok(inode) = InodeVal::parse(&v) {
+                    inodes.insert(hdr.obj_id, inode.clone());
+                    private_to_id.insert(inode.private_id, hdr.obj_id);
+                }
+            } else if hdr.obj_type == APFS_TYPE_DIR_REC {
+                let name = parse_drec_name(&k).unwrap_or_else(|| "<non-utf8>".to_string());
+                if let Some(drec) = DrecVal::parse(&v) {
+                    raw_drecs.push((hdr.obj_id, DirEntry {
+                        name,
+                        raw_id: drec.file_id,
+                        inode_id: None,
+                        flags: drec.flags,
+                        date_added: drec.date_added,
+                    }));
+                }
+            }
+        }
+
+        // Resolve inode_ids for all drecs
+        let mut drecs: std::collections::HashMap<u64, Vec<DirEntry>> = std::collections::HashMap::new();
+        for (parent_id, mut entry) in raw_drecs {
+            if inodes.contains_key(&entry.raw_id) {
+                entry.inode_id = Some(entry.raw_id);
+            } else if let Some(id) = private_to_id.get(&entry.raw_id) {
+                entry.inode_id = Some(*id);
+            } else {
+                // Ignore fallback resolution for speed; fallback requires BTree point lookups.
+                // In practice, well-formed APFS datasets map via raw_id or private_id.
+            }
+            drecs.entry(parent_id).or_default().push(entry);
+        }
+
+        Ok((inodes, drecs))
+    }
+
     /// Heuristic root inode detection for a volume.
     /// Fast path checks inode 2.
     pub fn detect_root_inode_id<T: std::io::Read + std::io::Seek>(

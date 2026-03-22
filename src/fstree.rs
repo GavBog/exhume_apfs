@@ -2,7 +2,7 @@
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::{TimeZone, Utc};
-use prettytable::{row, Table};
+use prettytable::{Table, row};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -16,6 +16,7 @@ const J_KEY_TYPE_SHIFT: u64 = 60;
 
 // j_obj_types values you need
 const APFS_TYPE_INODE: u8 = 3;
+const APFS_TYPE_XATTR: u8 = 4;
 const APFS_TYPE_FILE_EXTENT: u8 = 8;
 const APFS_TYPE_DIR_REC: u8 = 9;
 
@@ -334,7 +335,6 @@ pub struct DirEntry {
     pub date_added: u64,
 }
 
-
 /// File extent mapping for one owner id.
 ///
 /// Maps a logical range within a file to a physical block range on disk.
@@ -598,7 +598,6 @@ impl FsTree {
         self.dir_children_raw(apfs, dir_id)
     }
 
-
     /// Lists file extents for an owner id.
     pub fn file_extents<T: std::io::Read + std::io::Seek>(
         &self,
@@ -642,23 +641,113 @@ impl FsTree {
         Ok(out)
     }
 
+    /// Resolves the target path of a symbolic link.
+    pub fn symlink_target<T: std::io::Read + std::io::Seek>(
+        &self,
+        apfs: &mut crate::APFS<T>,
+        inode_id: u64,
+    ) -> Result<Option<String>, String> {
+        apfs.set_active_omap(Some(self.omap.clone()), self.xid);
 
+        let prefix = JKey::to_bytes(inode_id, APFS_TYPE_XATTR);
+        let mut cur = self.root_tree.seek(apfs, &prefix, &BTreeKeyCmp::ApfsJKey)?;
+
+        while let Some((k, v)) = cur.next(apfs)? {
+            let Some(hdr) = JKey::from_bytes(&k) else {
+                continue;
+            };
+
+            if hdr.obj_id != inode_id || hdr.obj_type != APFS_TYPE_XATTR {
+                break;
+            }
+
+            if k.len() < 10 {
+                continue;
+            }
+            let name_len = u16::from_le_bytes(k[8..10].try_into().unwrap()) as usize;
+            if k.len() < 10 + name_len {
+                continue;
+            }
+
+            let attr_name = String::from_utf8_lossy(&k[10..10 + name_len])
+                .trim_end_matches('\0')
+                .to_string();
+
+            if attr_name == "com.apple.fs.symlink" {
+                if v.len() < 4 {
+                    return Err("malformed xattr value".into());
+                }
+
+                let flags = u16::from_le_bytes(v[0..2].try_into().unwrap());
+                let xdata_len = u16::from_le_bytes(v[2..4].try_into().unwrap()) as usize;
+                let payload_len = std::cmp::min(xdata_len, v.len().saturating_sub(4));
+                let payload = &v[4..4 + payload_len];
+
+                // Non-resident symlink path.
+                if xdata_len == 8 && (flags & 2) != 0 {
+                    let potential_id = u64::from_le_bytes(payload.try_into().unwrap());
+
+                    if let Ok(extents) = self.file_extents(apfs, potential_id)
+                        && !extents.is_empty()
+                    {
+                        let mut raw_path = Vec::new();
+                        let block_size = apfs.block_size_u64();
+
+                        for ext in extents {
+                            let block_data = crate::io::read_phys(
+                                &mut apfs.body,
+                                block_size,
+                                ext.phys_block_num,
+                                ext.length_bytes as usize,
+                            )?;
+                            raw_path.extend(block_data);
+                        }
+
+                        return Ok(Some(
+                            String::from_utf8_lossy(&raw_path)
+                                .split('\0')
+                                .next()
+                                .unwrap_or("")
+                                .to_string(),
+                        ));
+                    }
+                }
+
+                // Resident symlink path.
+                return Ok(Some(
+                    String::from_utf8_lossy(payload)
+                        .trim_end_matches('\0')
+                        .to_string(),
+                ));
+            }
+        }
+
+        Ok(None)
+    }
 
     /// Scans the entire BTree sequentially and returns all Inodes and Directory Records.
     /// This avoids O(N log N) disk seeks during full filesystem enumeration.
     pub fn scan_all_records<T: std::io::Read + std::io::Seek>(
         &self,
         apfs: &mut crate::APFS<T>,
-    ) -> Result<(std::collections::HashMap<u64, InodeVal>, std::collections::HashMap<u64, Vec<DirEntry>>), String> {
+    ) -> Result<
+        (
+            std::collections::HashMap<u64, InodeVal>,
+            std::collections::HashMap<u64, Vec<DirEntry>>,
+        ),
+        String,
+    > {
         apfs.set_active_omap(Some(self.omap.clone()), self.xid);
         let mut cur = self.root_tree.seek(apfs, &[], &BTreeKeyCmp::Lex)?;
-        
+
         let mut inodes = std::collections::HashMap::new();
         let mut raw_drecs = Vec::new();
         let mut private_to_id = std::collections::HashMap::new();
 
         while let Some((k, v)) = cur.next(apfs)? {
-            let Some(hdr) = JKey::from_bytes(&k) else { continue; };
+            let Some(hdr) = JKey::from_bytes(&k) else {
+                continue;
+            };
             if hdr.obj_type == APFS_TYPE_INODE {
                 if let Ok(inode) = InodeVal::parse(&v) {
                     inodes.insert(hdr.obj_id, inode.clone());
@@ -667,19 +756,23 @@ impl FsTree {
             } else if hdr.obj_type == APFS_TYPE_DIR_REC {
                 let name = parse_drec_name(&k).unwrap_or_else(|| "<non-utf8>".to_string());
                 if let Some(drec) = DrecVal::parse(&v) {
-                    raw_drecs.push((hdr.obj_id, DirEntry {
-                        name,
-                        raw_id: drec.file_id,
-                        inode_id: None,
-                        flags: drec.flags,
-                        date_added: drec.date_added,
-                    }));
+                    raw_drecs.push((
+                        hdr.obj_id,
+                        DirEntry {
+                            name,
+                            raw_id: drec.file_id,
+                            inode_id: None,
+                            flags: drec.flags,
+                            date_added: drec.date_added,
+                        },
+                    ));
                 }
             }
         }
 
         // Resolve inode_ids for all drecs
-        let mut drecs: std::collections::HashMap<u64, Vec<DirEntry>> = std::collections::HashMap::new();
+        let mut drecs: std::collections::HashMap<u64, Vec<DirEntry>> =
+            std::collections::HashMap::new();
         for (parent_id, mut entry) in raw_drecs {
             if inodes.contains_key(&entry.raw_id) {
                 entry.inode_id = Some(entry.raw_id);
@@ -744,8 +837,6 @@ fn parse_drec_name(k: &[u8]) -> Option<String> {
         .ok()
         .map(ToString::to_string)
 }
-
-
 
 #[derive(Debug, Clone)]
 struct DrecVal {
